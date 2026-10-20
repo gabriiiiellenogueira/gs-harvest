@@ -32,8 +32,71 @@ TMP = os.path.join(B, "gs_tmp")
 os.makedirs(TMP, exist_ok=True)
 
 URLRE = re.compile(r"https://[^\s\"\\]+\.m3u8[^\s\"\\]*")
-H = json.loads(os.environ["VIP_HEADERS"]) if os.environ.get("VIP_HEADERS") \
+BASE = json.loads(os.environ["VIP_HEADERS"]) if os.environ.get("VIP_HEADERS") \
     else json.load(open(os.path.join(B, "gs_vip_headers.json"), encoding="utf-8"))
+
+# ---------------- contas convidadas (sem VIP) ----------------
+# Cada conta nova desbloqueia 8 capitulos pagos; trocar o afid evita o bloqueio
+# por instalacao. Os hosts de backup nao estao atras do Akamai que barra
+# datacenter, entao os runners do GitHub conseguem falar com a API.
+HOSTES = [x for x in os.environ.get(
+    "GS_HOSTS",
+    "https://api2.good-short.com,https://api.goodreels.com,https://api.good-short.com"
+).split(",") if x.strip()]
+COTA = int(os.environ.get("GS_COTA", "8"))
+_rc = {"contas": 0, "host": 0, "lock": threading.Lock()}
+_rcl = threading.local()
+
+
+def _afid_novo():
+    import random
+    return "%d-%d" % (random.randint(1792000000000, 1792999999999),
+                      random.randint(2000000000000000000, 2999999999999999999))
+
+
+def nova_conta():
+    """Cria conta convidada com fingerprint novo e escolhe um host."""
+    with _rc["lock"]:
+        host = HOSTES[_rc["host"] % len(HOSTES)]
+        _rc["host"] += 1
+    H = dict(BASE)
+    H.update({"deviceid": str(uuid.uuid4()), "androidid": "%016x" % uuid.uuid4().int,
+              "authorization": "", "afid": _afid_novo()})
+    for tent in range(4):
+        try:
+            st, r = C.chamar("hwycclientreels/app/bootstrap", {}, extra=H, host=host)
+            u = (json.loads(r).get("data") or {}).get("user") or {}
+            tok = u.get("token") or ""
+            if tok:
+                if not tok.startswith("Bearer "):
+                    tok = "Bearer " + tok
+                H["authorization"] = tok
+                with _rc["lock"]:
+                    _rc["contas"] += 1
+                _rcl.usados = 0
+                return H, host
+        except Exception:
+            time.sleep(1.5 * (tent + 1))
+    return None, host
+
+
+def conta():
+    """Headers+host da conta do thread, renovando a cada COTA desbloqueios."""
+    if getattr(_rcl, "H", None) is None or getattr(_rcl, "usados", 0) >= COTA:
+        H, host = nova_conta()
+        if H is None:
+            return None, None
+        _rcl.H, _rcl.host = H, host
+    return _rcl.H, _rcl.host
+
+
+def queimou():
+    _rcl.usados = getattr(_rcl, "usados", 0) + 1
+
+
+def troca_conta():
+    _rcl.usados = COTA
+
 
 # ---------------- B2 ----------------
 KID = os.environ.get("B2_KID", "0058801f4ba47340000000001")
@@ -80,6 +143,32 @@ def b2_nova_url():
 def b2_pool(n):
     for _ in range(n):
         _pool.put(b2_nova_url())
+
+
+def b2_listar(prefixo):
+    """Lista todos os nomes de arquivo sob um prefixo do bucket."""
+    with _lock:
+        if _b2["api"] is None:
+            b2_auth()
+        api, tok, bid = _b2["api"], _b2["tok"], _b2["bid"]
+    nomes = []
+    inicio = None
+    while True:
+        corpo = {"bucketId": bid, "prefix": prefixo, "maxFileCount": 1000}
+        if inicio:
+            corpo["startFileName"] = inicio
+        req = urllib.request.Request(
+            api + "/b2api/v2/b2_list_file_names",
+            data=json.dumps(corpo).encode(),
+            headers={"Authorization": tok, "Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=120) as r:
+            d = json.loads(r.read())
+        for f in d.get("files", []):
+            nomes.append(f["fileName"])
+        inicio = d.get("nextFileName")
+        if not inicio:
+            break
+    return nomes
 
 
 def b2_upload(caminho, key):
@@ -152,7 +241,9 @@ def baixar(url, saida):
 
 # ---------------- capitulos ----------------
 def capitulos(book):
-    st, r = C.chamar("hwycclientreels/chapter/list", {"bookId": book}, extra=H)
+    Hc, host = conta()
+    st, r = C.chamar("hwycclientreels/chapter/list", {"bookId": book},
+                     extra=Hc or BASE, host=host)
     try:
         d = json.loads(r)
     except Exception:
@@ -163,19 +254,41 @@ def capitulos(book):
 
 
 def urls_do_capitulo(book, cap):
-    cdn = cap.get("cdnList") or []
-    urls = [x.get("videoPath") for x in cdn if x.get("videoPath")]
-    if urls:
-        return urls
-    st, r = C.chamar("hwycclientreels/chapter/load",
-                     {"bookId": book, "chapterIds": [cap["id"]]}, extra=H)
-    return URLRE.findall(r)
+    # viewAd:true -> o servidor entrega a URL assinada de capitulo pago
+    # (funciona ate em conta convidada, sem VIP e sem anuncio)
+    for tent in range(4):
+        Hc, host = conta()
+        if Hc is None:
+            return []
+        try:
+            st, r = C.chamar("hwycclientreels/chapter/load",
+                             {"bookId": book, "chapterIds": [cap["id"]], "viewAd": True},
+                             extra=Hc, host=host)
+        except Exception:
+            time.sleep(1.5 * (tent + 1))
+            continue
+        try:
+            d = json.loads(r)
+        except Exception:
+            return []
+        if d.get("status") != 0:
+            troca_conta()
+            continue
+        it = ((d.get("data") or {}).get("list") or [{}])[0]
+        urls = [x.get("videoPath") for x in (it.get("cdnList") or []) if x.get("videoPath")]
+        if urls:
+            queimou()
+            return urls
+        troca_conta()          # conta sem cota: pega outra e tenta de novo
+    return []
 
 
 def meta_e_capa(book, caps):
     """Metadados completos (book/quick/open) + capa -> B2."""
+    Hc, host = conta()
     try:
-        st, r = C.chamar("hwycclientreels/book/quick/open", {"bookId": book}, extra=H)
+        st, r = C.chamar("hwycclientreels/book/quick/open", {"bookId": book},
+                         extra=Hc or BASE, host=host)
         d = json.loads(r)
         livro = (d.get("data") or {}).get("book") or {}
     except Exception:
@@ -241,9 +354,27 @@ def main():
                 done.add(json.loads(ln)["book"] + ":" + str(json.loads(ln)["chapterId"]))
             except Exception:
                 pass
-    print("já feitos:", len(done), flush=True)
+    print("já feitos (progresso local):", len(done), flush=True)
+
+    # pula o que ja esta no B2 (permite rodar varios runners com sobreposicao)
+    if not os.environ.get("GS_IGNORA_B2"):
+        try:
+            chaves = b2_listar("_videos/goodshort/")
+            for k in chaves:
+                p = k.split("/")
+                if len(p) >= 4:
+                    cid = p[3].rsplit("_", 1)[-1]
+                    if cid.endswith(".mp4"):
+                        cid = cid[:-4]
+                    done.add(p[2] + ":" + cid)
+            print("no B2:", len(chaves), "-> pular:", len(done), flush=True)
+        except Exception as e:
+            print("aviso: nao listei o B2:", repr(e)[:80], flush=True)
 
     ids = ([args.book] if args.book else json.load(open(args.ids, encoding="utf-8")))
+    # aceita lista de ids ou lista de objetos (gs_prioridade.json)
+    ids = [(x.get("gs_bookId") or x.get("book")) if isinstance(x, dict) else x for x in ids]
+    ids = [str(x) for x in ids if x]
     if args.of > 1:
         ids = [x for i, x in enumerate(ids) if i % args.of == args.shard]
     if args.limit:
