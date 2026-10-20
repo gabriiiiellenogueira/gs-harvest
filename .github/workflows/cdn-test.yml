@@ -1,0 +1,25 @@
+name: cdn-test
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "m3u8 assinado"
+        required: true
+jobs:
+  t:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: testa m3u8
+        run: |
+          echo "URL host: $(echo '${{ inputs.url }}' | cut -d/ -f3)"
+          CODE=$(curl -s -o /tmp/out.txt -w "%{http_code}" -A "okhttp/4.10.0" "${{ inputs.url }}")
+          echo "HTTP=$CODE"
+          head -c 300 /tmp/out.txt
+          echo ""
+          SEG=$(grep -v '^#' /tmp/out.txt | head -1)
+          if [ -n "$SEG" ]; then
+            BASE=$(echo '${{ inputs.url }}' | sed 's|/[^/]*$|/|')
+            CODE2=$(curl -s -o /tmp/seg.ts -w "%{http_code}" -A "okhttp/4.10.0" "${BASE}${SEG}")
+            echo "SEGMENTO HTTP=$CODE2 bytes=$(stat -c%s /tmp/seg.ts)"
+          fi
